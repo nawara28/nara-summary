@@ -171,6 +171,11 @@
                무관하게 매번 새로 뽑는 추측 불가능한 값이라, 주소만으로 어떤
                공고인지 예측할 수 없다.
            (2) 기존 형식: #d=<base64url(JSON)> 또는 ?d=<base64url(JSON)>
+           (3) 짧은 주소: #/s/<id 16자 base64url>/<key 22자 base64url> —
+               id의 FNV-1a 32비트 해시를 12로 나눈 나머지(팩 번호)로 정해지는
+               같은 사이트의 data/pack-<팩번호>.json({id: {"v":1,"iv","ct"}} 맵)
+               에서 id 항목을 가져와 key(AES-128 키 16바이트)로 AES-128-GCM
+               복호화한 JSON이 공고 객체.
            JSON 필드(스크레이퍼 공고와 동일):
            kind("bid"|"plan"), topic, title, agency, noticeNumber, amountText,
            postedAt, deadlineAt, sourceUrl, sourceName, excerpt,
@@ -233,6 +238,71 @@
           } catch (e) { /* 주소 파싱 실패는 빈 상태로 */ }
           if (!raw) return null;
           return decodePayload(raw);
+        }
+
+        /* ---------- 짧은 주소: #/s/<id>/<key> ----------
+           공고 데이터는 팩 파일 하나에 여러 개가 모여 있다. id로 팩 번호를
+           구해 페이지와 같은 사이트의 data/pack-<팩번호>.json을 fetch하고
+           (캐시 우회 쿼리 없음), 맵에서 id 항목을 꺼내 key 바이트를 AES-128
+           키로 써서 AES-128-GCM 암호문을 복호화하면 #/p/ 페이로드와 동일한
+           공고 객체가 된다. */
+        /* 팩 번호: id 문자열의 FNV-1a 32비트 해시를 12로 나눈 나머지 */
+        function packNumber(id) {
+          var hash = 2166136261;
+          for (var i = 0; i < id.length; i++) {
+            hash = (hash ^ id.charCodeAt(i)) >>> 0;
+            hash = Math.imul(hash, 16777619) >>> 0;
+          }
+          return hash % 12;
+        }
+        function parseShortLink(hash) {
+          if (!hash) return null;
+          var m = hash.match(/^#\/s\/([A-Za-z0-9_-]{16})\/([A-Za-z0-9_-]{22})\/?$/);
+          if (!m) return null;
+          return { id: m[1], key: m[2] };
+        }
+        function b64urlToBytes(s) {
+          var b64 = String(s).replace(/-/g, "+").replace(/_/g, "/");
+          while (b64.length % 4) b64 += "=";
+          var bin = atob(b64);
+          var bytes = new Uint8Array(bin.length);
+          for (var i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+          return bytes;
+        }
+        function loadShortNotice(short) {
+          return fetch("data/pack-" + packNumber(short.id) + ".json")
+            .then(function (res) {
+              if (!res.ok) throw new Error("http " + res.status);
+              return res.json();
+            })
+            .then(function (map) {
+              var file = map && typeof map === "object" ? map[short.id] : null;
+              if (!file || file.v !== 1 || typeof file.iv !== "string" || typeof file.ct !== "string") {
+                throw new Error("bad file");
+              }
+              var keyBytes = b64urlToBytes(short.key);
+              if (keyBytes.length !== 16) throw new Error("bad key");
+              return crypto.subtle.importKey("raw", keyBytes, { name: "AES-GCM" }, false, ["decrypt"])
+                .then(function (key) {
+                  return crypto.subtle.decrypt(
+                    { name: "AES-GCM", iv: b64urlToBytes(file.iv) },
+                    key,
+                    b64urlToBytes(file.ct)
+                  );
+                });
+            })
+            .then(function (plain) {
+              var obj = JSON.parse(new TextDecoder("utf-8").decode(new Uint8Array(plain)));
+              if (!obj || typeof obj !== "object" || typeof obj.title !== "string" || !obj.title) {
+                throw new Error("bad payload");
+              }
+              return obj;
+            })
+            .catch(function () { return null; });
+        }
+        function buildShortLink(short) {
+          var base = window.location.origin + window.location.pathname;
+          return base + "#/s/" + short.id + "/" + short.key;
         }
 
         /* ---------- 랜덤 공유 링크 만들기 ----------
@@ -322,7 +392,7 @@
           return wrap;
         }
 
-        function renderNotice(n) {
+        function renderNotice(n, shortLink) {
           var main = el("main");
           main.appendChild(el("p", "page-label", "공유받은 공고 요약 · NARAJANGTEO SUMMARY"));
 
@@ -470,24 +540,27 @@
             main.appendChild(actions);
           }
 
-          /* 이 공고 공유 링크 — 누를 때마다 랜덤 토큰 주소가 새로 생성됨 */
+          /* 이 공고 공유 링크 — 짧은 주소로 연 경우 지금 보고 있는 짧은 주소를
+             공유하고, 아니면 누를 때마다 랜덤 토큰 주소가 새로 생성됨 */
           var share = el("div", "share");
           share.appendChild(el("h2", null, "이 공고 공유 링크"));
-          share.appendChild(el("p", "share-note",
-            "버튼을 누를 때마다 공고번호와 무관한 랜덤 주소가 새로 만들어집니다. 링크를 열면 로그인 없이 이 요약을 그대로 볼 수 있습니다."));
+          share.appendChild(el("p", "share-note", shortLink
+            ? "지금 보고 있는 짧은 주소입니다. 이 주소를 공유하면 로그인 없이 이 요약을 그대로 볼 수 있습니다."
+            : "버튼을 누를 때마다 공고번호와 무관한 랜덤 주소가 새로 만들어집니다. 링크를 열면 로그인 없이 이 요약을 그대로 볼 수 있습니다."));
           var shareRow = el("div", "share-row");
-          var linkBox = el("div", "share-link-box mono", "아직 만든 링크가 없습니다.");
+          var linkBox = el("div", "share-link-box mono", shortLink || "아직 만든 링크가 없습니다.");
           linkBox.setAttribute("aria-live", "polite");
-          var shareBtn = el("button", "share-btn", "랜덤 링크 만들기 · 복사");
+          var shareLabel = shortLink ? "링크 복사" : "랜덤 링크 만들기 · 복사";
+          var shareBtn = el("button", "share-btn", shareLabel);
           shareBtn.type = "button";
           var resetTimer = null;
           shareBtn.addEventListener("click", function () {
-            var link = buildShareLink(n);
+            var link = shortLink || buildShareLink(n);
             linkBox.textContent = link;
             copyText(link, function () {
               shareBtn.textContent = "복사됨 ✓";
               if (resetTimer) clearTimeout(resetTimer);
-              resetTimer = setTimeout(function () { shareBtn.textContent = "랜덤 링크 만들기 · 복사"; }, 1800);
+              resetTimer = setTimeout(function () { shareBtn.textContent = shareLabel; }, 1800);
             });
           });
           shareRow.appendChild(linkBox);
@@ -499,6 +572,18 @@
             "이 페이지는 나라장터 공고의 요약입니다. 요약은 공고 첨부문서를 분석해 작성됐으며, 정확한 내용은 위 원문에서 확인하세요."));
 
           document.title = n.title + " · 나라장터 공고 요약";
+          return main;
+        }
+
+        /* 짧은 주소를 열 수 없을 때 (파일 없음·복호화 실패·형식 오류) */
+        function renderShortError() {
+          var main = el("main");
+          var box = el("div", "empty");
+          box.appendChild(el("div", "empty-mark", "/"));
+          box.appendChild(el("h1", null, "링크를 열 수 없어요"));
+          box.appendChild(el("p", null,
+            "공고 데이터가 없거나 링크가 올바르지 않습니다. 공유받은 짧은 주소 전체를 그대로 다시 열어 주세요."));
+          main.appendChild(box);
           return main;
         }
 
@@ -514,14 +599,30 @@
           return main;
         }
 
-        var payload = readPayload();
         var topHash = topLocationValue("hash");
         var topSearch = topLocationValue("search");
-        var hadParam = /[#?&]d=/.test(window.location.href) || (window.location.hash || "").indexOf("#/p/") === 0
-          || topHash.indexOf("#/p/") === 0 || /[#?&]d=/.test(topHash) || /[#?&]d=/.test(topSearch);
-        var rendered = payload ? renderNotice(payload) : renderEmpty(hadParam);
-        app.replaceWith(rendered);
-        rendered.id = "app";
+        var short = parseShortLink(window.location.hash || "") || parseShortLink(topHash);
+        var shortAttempted = (window.location.hash || "").indexOf("#/s/") === 0 || topHash.indexOf("#/s/") === 0;
+        if (short) {
+          /* 짧은 주소: 팩 파일을 가져와 id 항목을 복호화한 뒤 기존 렌더러로 표시.
+             그동안 처음의 불러오는 중 상태가 그대로 보인다. */
+          loadShortNotice(short).then(function (obj) {
+            var renderedS = obj ? renderNotice(obj, buildShortLink(short)) : renderShortError();
+            app.replaceWith(renderedS);
+            renderedS.id = "app";
+          });
+        } else if (shortAttempted) {
+          var badShort = renderShortError();
+          app.replaceWith(badShort);
+          badShort.id = "app";
+        } else {
+          var payload = readPayload();
+          var hadParam = /[#?&]d=/.test(window.location.href) || (window.location.hash || "").indexOf("#/p/") === 0
+            || topHash.indexOf("#/p/") === 0 || /[#?&]d=/.test(topHash) || /[#?&]d=/.test(topSearch);
+          var rendered = payload ? renderNotice(payload) : renderEmpty(hadParam);
+          app.replaceWith(rendered);
+          rendered.id = "app";
+        }
       })();
     </script>
   </body>
